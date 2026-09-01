@@ -68,11 +68,6 @@ osu-storyboard-render [选项] [storyboard.osb | beatmap.osu | beatmap.osz]
 ```
 src/
 ├── main.rs              CLI 与运行模式分发
-├── osb/                 storyboard 源码解析
-│   ├── parser.rs        [Events] 行级解析（元素/命令/循环/触发器/引号路径）
-│   ├── model.rs         数据模型（层、原点、命令效果、元素）
-│   ├── easing.rs        33 种缓动
-│   └── timeline.rs      循环展开 + 按通道采样求值 state_at(t)
 ├── render/
 │   ├── gpu.rs           wgpu Instance/Adapter/Device
 │   ├── texture.rs       贴图加载与路径回退
@@ -82,6 +77,11 @@ src/
 ├── player.rs            winit 播放器
 └── screenshot.rs        离屏渲染 → PNG
 ```
+
+storyboard 解析（原 `src/osb/` + `loader.rs`:parser/model/easing/timeline、
+.osu Events + 共享 .osb 合并）已迁至共享 crate
+[osu-parse](../osu-parse) 的 `storyboard` 模块,本仓库 re-export 为
+`osu_storyboard_render::osb` / `::loader`,既有引用不受影响。
 
 渲染路径：解析 → 编译（`L` 展开为绝对时间命令，按通道分桶排序）→ 每帧 `state_at(t)` 求值 → 生成实例（位置/尺寸/锚点/旋转/颜色/翻转）→ 单顶点缓冲 + 实例缓冲逐精灵绘制。
 
