@@ -1,9 +1,9 @@
 //! winit 窗口播放器：实时回放 storyboard，支持暂停/快进/调速。
 
-use crate::osb::timeline::{CompiledStoryboard, FailState};
-use crate::render::gpu::GpuContext;
-use crate::render::renderer::{build_draws, Renderer};
-use crate::render::texture::Assets;
+use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState};
+use osu_storyboard_render::render::gpu::GpuContext;
+use osu_storyboard_render::render::renderer::{build_draws, Renderer};
+use osu_storyboard_render::render::texture::Assets;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
@@ -168,7 +168,7 @@ impl App {
         };
         let view = frame.texture.create_view(&Default::default());
         let draws = build_draws(renderer, assets, sb, self.clock.t, self.fail);
-        renderer.render(&view, self.format, self.size.0, self.size.1, sb.widescreen, &draws);
+        renderer.render(&view, self.format, self.size.0, self.size.1, sb.widescreen, &draws, [0.0, 0.0, 0.0, 1.0]);
         frame.present();
 
         // 每 300ms 更新一次标题

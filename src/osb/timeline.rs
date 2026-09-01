@@ -212,7 +212,10 @@ impl CompiledStoryboard {
                     end = end.max(c.end_time);
                 }
             }
-            if sprite.always_visible {
+            if sprite.always_visible || count == 0 {
+                // 旧行背景常驻;无任何命令(含循环)的精灵同样常驻——
+                // osu! 语义:命令全空的 Sprite 以声明位置、alpha 1 永久
+                // 显示(.osb 接管背景时编辑器写的就是这种裸精灵)。
                 start = 0.0;
                 end = f32::INFINITY;
             }

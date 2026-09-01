@@ -1,9 +1,9 @@
 //! 无窗口渲染：离屏渲染一帧并保存为 PNG（不依赖显示服务器）。
 
-use crate::osb::timeline::{CompiledStoryboard, FailState};
-use crate::render::gpu::GpuContext;
-use crate::render::renderer::{build_draws, Renderer};
-use crate::render::texture::Assets;
+use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState};
+use osu_storyboard_render::render::gpu::GpuContext;
+use osu_storyboard_render::render::renderer::{build_draws, Renderer};
+use osu_storyboard_render::render::texture::Assets;
 use anyhow::Result;
 use image::RgbaImage;
 use std::sync::mpsc;
@@ -34,7 +34,7 @@ pub fn render_screenshot(
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    renderer.render(&view, wgpu::TextureFormat::Rgba8Unorm, width, height, sb.widescreen, &draws);
+    renderer.render(&view, wgpu::TextureFormat::Rgba8Unorm, width, height, sb.widescreen, &draws, [0.0, 0.0, 0.0, 1.0]);
 
     // 回读到 CPU
     let bytes_per_row = (width * 4).next_multiple_of(256);

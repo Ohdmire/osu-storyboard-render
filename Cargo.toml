@@ -5,17 +5,32 @@ edition = "2021"
 description = "Render osu! storyboards (.osb / .osu Events) from source with wgpu"
 license = "MIT"
 
+[lib]
+name = "osu_storyboard_render"
+path = "src/lib.rs"
+
+[[bin]]
+name = "osu-storyboard-render"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# 播放器 CLI:winit 窗口、env_logger、osz 解包。嵌入器(如
+# osu-replay-render / ReplayOA)以 default-features = false 依赖本库,
+# 不把这些依赖拉进 Android 等目标。
+cli = ["dep:winit", "dep:env_logger", "dep:zip"]
+
 [dependencies]
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
-env_logger = { version = "0.11", default-features = false }
-glam = "0.29"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga", "webp"] }
 log = "0.4"
 pollster = "0.4"
 wgpu = "24"
-winit = "0.30"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+env_logger = { version = "0.11", default-features = false, optional = true }
+winit = { version = "0.30", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 [profile.dev]
 opt-level = 1

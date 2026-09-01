@@ -13,6 +13,11 @@ pub struct Assets {
     /// root 下全部文件的小写相对路径索引（懒构建）。
     index: Option<HashMap<String, PathBuf>>,
     cache: HashMap<String, Option<RgbaImage>>,
+    /// 已缓存解码图像的字节合计(仅 Some 项)。
+    cache_bytes: usize,
+    /// CPU 解码缓存预算(字节);超出后任意淘汰未命中项,下次重解码。
+    /// usize::MAX = 不限制(独立播放器行为)。
+    max_cache_bytes: usize,
     warned: HashSet<String>,
 }
 
@@ -41,6 +46,8 @@ impl Assets {
             memory: HashMap::new(),
             index: None,
             cache: HashMap::new(),
+            cache_bytes: 0,
+            max_cache_bytes: usize::MAX,
             warned: HashSet::new(),
         }
     }
@@ -52,8 +59,17 @@ impl Assets {
             memory: map,
             index: None,
             cache: HashMap::new(),
+            cache_bytes: 0,
+            max_cache_bytes: usize::MAX,
             warned: HashSet::new(),
         }
+    }
+
+    /// CPU 解码缓存预算(字节):视频式逐帧动画的 storyboard 可引用成千张
+    /// 独立贴图,嵌入式宿主应设上限防内存膨胀;超限后随机淘汰缓存项
+    /// (HashMap 无序,循环动画场景下被淘汰的很快会重新解码)。
+    pub fn set_cache_budget(&mut self, bytes: usize) {
+        self.max_cache_bytes = bytes;
     }
 
     pub fn get(&mut self, logical: &str) -> Option<&RgbaImage> {
@@ -63,9 +79,36 @@ impl Assets {
             if loaded.is_none() && self.warned.insert(norm.clone()) {
                 log::warn!("缺少贴图: {norm}");
             }
+            if let Some(img) = &loaded {
+                self.cache_bytes += (img.width() * img.height() * 4) as usize;
+            }
             self.cache.insert(norm.clone(), loaded);
+            self.evict_over_budget(&norm);
         }
         self.cache.get(&norm).and_then(|o| o.as_ref())
+    }
+
+    /// 超预算时淘汰任意非 `keep` 的缓存项(重解码的代价可接受)。
+    fn evict_over_budget(&mut self, keep: &str) {
+        if self.cache_bytes <= self.max_cache_bytes {
+            return;
+        }
+        let target = self.max_cache_bytes / 4 * 3;
+        let mut victims: Vec<String> = self
+            .cache
+            .iter()
+            .filter(|(k, v)| v.is_some() && k.as_str() != keep)
+            .map(|(k, _)| k.clone())
+            .collect();
+        // HashMap 迭代序随机,直接当作随机选取。
+        for key in victims.drain(..) {
+            if self.cache_bytes <= target {
+                break;
+            }
+            if let Some(Some(img)) = self.cache.remove(&key) {
+                self.cache_bytes -= (img.width() * img.height() * 4) as usize;
+            }
+        }
     }
 
     fn load(&mut self, norm: &str) -> Option<RgbaImage> {

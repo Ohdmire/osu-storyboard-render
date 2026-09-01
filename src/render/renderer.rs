@@ -43,6 +43,8 @@ struct Pipelines {
 }
 
 pub struct TextureSlot {
+    /// 原始纹理句柄:视频等逐帧更新的外部纹理需要重复 write_texture。
+    pub texture: wgpu::Texture,
     pub bind_group: wgpu::BindGroup,
     pub size: [u32; 2],
 }
@@ -62,6 +64,14 @@ pub struct Renderer {
     instance_buf: wgpu::Buffer,
     instance_cap: u64,
     textures: HashMap<String, TextureSlot>,
+    /// 每个已上传贴图的字节数合计(w*h*4)。
+    texture_bytes: usize,
+    /// GPU 贴图预算(字节);超出后按 LRU 淘汰不在本帧使用的槽位。
+    /// usize::MAX = 不限制(独立播放器行为)。
+    max_gpu_bytes: usize,
+    /// 帧计数,驱动 last_used 的 LRU 淘汰。
+    frame: u64,
+    last_used: HashMap<String, u64>,
 }
 
 impl Renderer {
@@ -164,7 +174,18 @@ impl Renderer {
             instance_buf,
             instance_cap,
             textures: HashMap::new(),
+            texture_bytes: 0,
+            max_gpu_bytes: usize::MAX,
+            frame: 0,
+            last_used: HashMap::new(),
         }
+    }
+
+    /// GPU 贴图内存预算(字节):超出后 LRU 淘汰未在本帧使用的贴图槽,
+    /// 下次用到时重新上传。嵌入式宿主(手机等内存受限环境)应设置;
+    /// 独立播放器默认不限。
+    pub fn set_gpu_budget(&mut self, bytes: usize) {
+        self.max_gpu_bytes = bytes;
     }
 
     pub fn upload_texture(&mut self, key: &str, img: &RgbaImage) {
@@ -183,16 +204,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            img.as_raw(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            size,
-        );
+        write_rgba(&self.queue, &texture, w, h, img.as_raw());
         let view = texture.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(key),
@@ -202,7 +214,28 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        self.textures.insert(key.to_string(), TextureSlot { bind_group, size: [w, h] });
+        self.texture_bytes += (w * h * 4) as usize;
+        self.textures.insert(key.to_string(), TextureSlot { texture, bind_group, size: [w, h] });
+    }
+
+    /// 写入/更新一个外部逐帧纹理(视频通道):尺寸不变时原地
+    /// write_texture,变化时重建纹理与绑定组。内容为 RGBA 行主序。
+    /// 返回是否新建了纹理(首帧)。不走 LRU 记账——视频纹理常驻,
+    /// 只有一帧的量。
+    pub fn write_frame(&mut self, key: &str, w: u32, h: u32, rgba: &[u8]) -> bool {
+        debug_assert_eq!(rgba.len(), (w * h * 4) as usize);
+        if let Some(slot) = self.textures.get(key) {
+            if slot.size == [w, h] {
+                write_rgba(&self.queue, &slot.texture, w, h, rgba);
+                return false;
+            }
+            let old = self.textures.remove(key).unwrap();
+            self.texture_bytes -= (old.size[0] * old.size[1] * 4) as usize;
+            self.last_used.remove(key);
+        }
+        let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("frame size mismatch");
+        self.upload_texture(key, &img);
+        true
     }
 
     pub fn texture(&self, key: &str) -> Option<&TextureSlot> {
@@ -287,6 +320,8 @@ impl Renderer {
     }
 
     /// 渲染一帧。draws 顺序即绘制顺序（画家算法）。widescreen=false 时固定 4:3（黑边）。
+    /// `clear` 为 RGBA 清屏色(合成到宿主场景时传透明 `[0,0,0,0]`,
+    /// 4:3 黑边区域保持透明而不是黑)。
     pub fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -295,7 +330,12 @@ impl Renderer {
         height: u32,
         widescreen: bool,
         draws: &[Draw],
+        clear: [f64; 4],
     ) {
+        self.frame += 1;
+        for d in draws {
+            self.last_used.insert(d.texture.clone(), self.frame);
+        }
         let globals = Globals { mvp: ortho_640x480(width, height, widescreen) };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -330,7 +370,12 @@ impl Renderer {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0],
+                            g: clear[1],
+                            b: clear[2],
+                            a: clear[3],
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -359,7 +404,62 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(encoder.finish()));
+
+        // GPU 贴图超预算:淘汰最久未用(且不在本帧 draw 里)的槽位。
+        // 提交后再删,保证本帧已绑定的 bind group 不会失效。
+        if self.texture_bytes > self.max_gpu_bytes {
+            let mut candidates: Vec<(String, u64, usize)> = self
+                .textures
+                .iter()
+                .filter(|(k, _)| self.last_used.get(*k).copied().unwrap_or(0) < self.frame)
+                .map(|(k, slot)| (k.clone(), self.last_used.get(k).copied().unwrap_or(0), (slot.size[0] * slot.size[1] * 4) as usize))
+                .collect();
+            candidates.sort_by_key(|(_, used, _)| *used);
+            for (key, _, bytes) in candidates {
+                if self.texture_bytes <= self.max_gpu_bytes {
+                    break;
+                }
+                self.textures.remove(&key);
+                self.last_used.remove(&key);
+                self.texture_bytes -= bytes;
+            }
+        }
     }
+}
+
+/// Queue 一个 RGBA 行主序上传。wgpu 要求 bytes_per_row 对齐 256:
+/// 宽度非 64 倍数时按对齐行距重排(视频与精灵宽度都可能任意)。
+fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, w: u32, h: u32, rgba: &[u8]) {
+    let tight = w * 4;
+    let dst = wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d::ZERO,
+        aspect: wgpu::TextureAspect::All,
+    };
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    if tight % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0 {
+        queue.write_texture(
+            dst,
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(tight), rows_per_image: Some(h) },
+            size,
+        );
+        return;
+    }
+    let bpr = (tight + wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1) & !(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1);
+    let mut padded = vec![0u8; (bpr * h) as usize];
+    for row in 0..h as usize {
+        let src = row * tight as usize;
+        let d = row * bpr as usize;
+        padded[d..d + tight as usize].copy_from_slice(&rgba[src..src + tight as usize]);
+    }
+    queue.write_texture(
+        dst,
+        &padded,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+        size,
+    );
 }
 
 /// 640x480 正交投影：高固定 480；widescreen 时宽按目标纵横比向两侧扩展，
@@ -390,8 +490,25 @@ pub fn build_draws(
     t: f32,
     fail: FailState,
 ) -> Vec<Draw> {
+    build_draws_filtered(renderer, assets, sb, t, fail, |_| true)
+}
+
+/// [`build_draws`] 的层过滤版本:嵌入宿主把 storyboard 拆到游戏画面上下
+/// 两侧时用(osu! 层序:Background/Fail/Pass 在游戏区之下,Foreground/
+/// Overlay 在其上)。`include` 对每个元素的层返回是否参与本次求值。
+pub fn build_draws_filtered(
+    renderer: &mut Renderer,
+    assets: &mut Assets,
+    sb: &CompiledStoryboard,
+    t: f32,
+    fail: FailState,
+    include: impl Fn(&Layer) -> bool,
+) -> Vec<Draw> {
     let mut out = Vec::new();
     for el in &sb.elements {
+        if !include(&el.layer) {
+            continue;
+        }
         if el.layer == Layer::Fail && fail == FailState::Pass {
             continue;
         }

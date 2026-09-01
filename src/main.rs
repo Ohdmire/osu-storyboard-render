@@ -1,15 +1,16 @@
 //! osu-storyboard-render —— 从 storyboard 源文件（.osb / .osu）渲染动画。
 //!
 //! 解析 Events 节的 Sprite/Animation/命令/循环/触发器，用 wgpu 实时播放或离屏截图。
+//! 解析/渲染核心在 `osu_storyboard_render` 库中,本文件只是 CLI 壳。
 
-mod osb;
 mod player;
-mod render;
 mod screenshot;
 
-use crate::osb::timeline::{CompiledStoryboard, FailState};
-use crate::render::demo;
-use crate::render::texture::Assets;
+use osu_storyboard_render::loader;
+use osu_storyboard_render::osb::parser;
+use osu_storyboard_render::osb::timeline::{CompiledStoryboard, FailState};
+use osu_storyboard_render::render::demo;
+use osu_storyboard_render::render::texture::{frame_path, Assets};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -158,30 +159,23 @@ fn run(args: Args) -> Result<()> {
         if args.path.is_none() && !args.demo {
             println!("未指定文件，使用内置 demo（--demo 可显式指定；-h 查看帮助）");
         }
-        (osb::parser::parse(demo::storyboard())?, Assets::memory(demo::textures()))
+        (parser::parse(demo::storyboard())?, Assets::memory(demo::textures()))
     } else {
         let loaded = load_storyboard(&args.path.clone().unwrap(), args.diff.as_deref())?;
         let root = args.assets_dir.clone().unwrap_or(loaded.root);
         let assets = Assets::disk(root);
 
-        // osu! 的 storyboard = 所选难度 .osu 的 [Events] 在前 + 共用 .osb 在后；
-        // 同层内按解析顺序绘制，因此先 .osu 后 .osb 追加。
-        let mut sb = match loaded.osu {
-            Some(p) => osb::parser::parse(&read_file(&p)?)?,
-            None => osb::model::Storyboard::default(),
+        // 独立播放器保留旧版背景行(常驻精灵);.osu 输入经 loader 与
+        // 同目录共用 .osb 合并,纯 .osb 输入直接解析。
+        let sb = match loaded.source {
+            Source::Osu => loader::load_beatmap(&loaded.osu, false)
+                .map(|l| l.story)
+                .unwrap_or_default(),
+            Source::Osb => std::fs::read_to_string(&loaded.osu)
+                .ok()
+                .and_then(|t| parser::parse(&t).ok())
+                .unwrap_or_default(),
         };
-        if let Some(p) = loaded.osb {
-            // 稳定版中谱面背景图由 .osb 接管：编辑器把背景写成 .osb 首个精灵并用
-            // F,0,0,,0 隐藏（实机画面里背景行不可见），合并时跳过 .osu 的旧版背景行。
-            sb.elements.retain(|e| !e.sprite().always_visible);
-            let shared = osb::parser::parse(&read_file(&p)?)?;
-            sb.elements.extend(shared.elements);
-            sb.videos.extend(shared.videos);
-            sb.samples.extend(shared.samples);
-            if sb.widescreen.is_none() {
-                sb.widescreen = shared.widescreen;
-            }
-        }
         if sb.elements.is_empty() {
             bail!("storyboard 中没有可渲染的元素");
         }
@@ -257,15 +251,18 @@ fn run(args: Args) -> Result<()> {
     player::run(compiled, assets, cfg)
 }
 
-/// .osz 解包后的 storyboard 组成：难度 .osu + 共用 .osb + 素材根目录。
+/// .osz 解包后的 storyboard 组成：难度 .osu（或纯 .osb）+ 素材根目录。
+/// （共用 .osb 由 `loader::load_beatmap` 在 .osu 所在目录自行发现并合并。）
 struct Loaded {
-    osb: Option<PathBuf>,
-    osu: Option<PathBuf>,
+    /// 输入文件按 .osu 还是 .osb 解释。
+    source: Source,
+    osu: PathBuf,
     root: PathBuf,
 }
 
-fn read_file(p: &Path) -> Result<String> {
-    std::fs::read_to_string(p).with_context(|| format!("读取 {}", p.display()))
+enum Source {
+    Osu,
+    Osb,
 }
 
 /// 解析输入路径：.osz 自动解包到临时目录，按 --diff 选择难度；.osb/.osu 直接读取。
@@ -282,8 +279,8 @@ fn load_storyboard(path: &Path, diff: Option<&str>) -> Result<Loaded> {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new(".").to_path_buf());
         let lower = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        let (osb, osu) = if lower == "osb" { (Some(path.to_path_buf()), None) } else { (None, Some(path.to_path_buf())) };
-        return Ok(Loaded { osb, osu, root });
+        let source = if lower == "osb" { Source::Osb } else { Source::Osu };
+        return Ok(Loaded { source, osu: path.to_path_buf(), root });
     }
 
     let file = std::fs::File::open(path).with_context(|| format!("打开 {}", path.display()))?;
@@ -348,11 +345,18 @@ fn load_storyboard(path: &Path, diff: Option<&str>) -> Result<Loaded> {
         }
         None => osus.first().cloned(),
     };
-    if osb.is_none() && osu.is_none() {
+    // 只有 .osb 的包:把它当输入文件直接解析。
+    let source = if osu.is_some() { Source::Osu } else { Source::Osb };
+    let input = osu.clone().or(osb.clone());
+    let Some(input) = input else {
         bail!("{} 中未找到 .osb/.osu 文件", path.display());
-    }
-    log::info!("难度 storyboard: {} + {}", osu.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into()), osb.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into()));
-    Ok(Loaded { osb, osu, root })
+    };
+    log::info!(
+        "难度 storyboard: {} + {}",
+        osu.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into()),
+        osb.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无）".into())
+    );
+    Ok(Loaded { source, osu: input, root })
 }
 
 fn print_summary(cs: &CompiledStoryboard, assets: &mut Assets) {
@@ -391,7 +395,7 @@ fn print_summary(cs: &CompiledStoryboard, assets: &mut Assets) {
         match &e.animation {
             Some(a) => {
                 for i in 0..a.frame_count {
-                    check(render::texture::frame_path(&e.path, i as usize), &mut missing);
+                    check(frame_path(&e.path, i as usize), &mut missing);
                 }
             }
             None => check(e.path.clone(), &mut missing),
