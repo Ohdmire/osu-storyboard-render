@@ -238,6 +238,24 @@ impl Renderer {
         true
     }
 
+    /// 注册一张宿主提供的 GPU 纹理为逐帧视频通道(零拷贝路径:宿主经
+    /// AHardwareBuffer 导入的解码帧)。替换既有槽位;纹理不进 LRU/字节
+    /// 记账,旧槽位随 wgpu 生命周期销毁。返回是否替换了已有槽。
+    pub fn set_frame_texture(&mut self, key: &str, texture: wgpu::Texture, w: u32, h: u32) -> bool {
+        let replaced = self.textures.remove(key).is_some();
+        let view = texture.create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(key),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.textures.insert(key.to_string(), TextureSlot { texture, bind_group, size: [w, h] });
+        replaced
+    }
+
     pub fn texture(&self, key: &str) -> Option<&TextureSlot> {
         self.textures.get(key)
     }

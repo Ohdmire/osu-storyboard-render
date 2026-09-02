@@ -1308,13 +1308,14 @@ dependencies = [
 [[package]]
 name = "osu-parse"
 version = "0.1.0"
+source = "git+https://github.com/Ohdmire/osu-parse.git#32eff487538c0b4e2c51c5c8e3dd0fdbb0d50824"
 dependencies = [
  "lzma-rs",
 ]
 
 [[package]]
 name = "osu-storyboard-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytemuck",
