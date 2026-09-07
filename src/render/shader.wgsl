@@ -45,6 +45,10 @@ fn vs(v: VertexIn) -> VertexOut {
 
 @fragment
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+    // 贴图已预乘(RGB 含自身 alpha);color.a 是淡入淡出系数。
+    // 预乘结果 = texel_premult.rgb × color.rgb × color.a,
+    // 配合 One/OneMinusSrcAlpha 混合,透明边界无黑色插值伪影。
     let texel = textureSample(sprite_tex, sprite_sampler, in.uv);
-    return vec4<f32>(texel.rgb * in.color.rgb, texel.a * in.color.a);
+    let a = texel.a * in.color.a;
+    return vec4<f32>(texel.rgb * in.color.rgb * in.color.a, a);
 }

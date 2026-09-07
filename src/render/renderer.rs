@@ -192,6 +192,20 @@ impl Renderer {
         if self.textures.contains_key(key) {
             return;
         }
+        // 预乘 alpha:RGB × A 写入纹理。透明像素 RGB=0,双线性插值
+        // 不会把黑色混入可见边缘 —— 旋转/缩放精灵的黑边/黑块根因。
+        let mut premult = img.clone();
+        for px in premult.pixels_mut() {
+            let a = px[3] as u32;
+            if a == 0 {
+                px[0] = 0; px[1] = 0; px[2] = 0;
+            } else if a < 255 {
+                px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+                px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+                px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+            }
+        }
+        let img = &premult;
         let (w, h) = img.dimensions();
         let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -320,10 +334,24 @@ impl Renderer {
                     cache: None,
                 })
             };
-            let normal = make(wgpu::BlendState::ALPHA_BLENDING);
+            // 预乘 alpha 混合:贴图上传时已 RGB×A,One/OneMinusSrcAlpha
+            // 数学等价于直线 alpha 的 SrcAlpha/OneMinusSrcAlpha,但双线性
+            // 插值在透明边界不再产生黑色边沿
+            let normal = make(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            });
             let additive = make(wgpu::BlendState {
                 color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    src_factor: wgpu::BlendFactor::One,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },
