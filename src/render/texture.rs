@@ -108,6 +108,25 @@ impl Assets {
         self.cache.get(&norm).and_then(|o| o.as_ref())
     }
 
+    /// 丢弃一张已缓存的解码图(所有权释放):贴图上传 GPU 后 CPU 副本
+    /// 即为纯浪费——SB 贴图 CPU/GPU 双驻留是宿主内存的大头(triangles
+    /// 一类 200MB 量级)。GPU 侧 LRU 淘汰该槽位后,下次 `get` 重新解码。
+    /// 仅移除 Some 项并扣减记账;不会把条目改写成 None(那会把它误标为
+    /// 缺失,导致精灵永久消失)。
+    pub fn discard(&mut self, logical: &str) {
+        let norm = normalize_path(logical);
+        match self.cache.get_mut(&norm) {
+            Some(slot) if slot.is_some() => {
+                let img = slot.take().expect("is_some 已确认");
+                self.cache_bytes -= (img.width() * img.height() * 4) as usize;
+                // 整条目移除(不能停留成 None——那会被当成缺失标记)
+                self.cache.remove(&norm);
+            }
+            // None = 缺失标记:保留,避免每帧重试加载
+            _ => {}
+        }
+    }
+
     /// 超预算时淘汰任意非 `keep` 的缓存项(重解码的代价可接受)。
     fn evict_over_budget(&mut self, keep: &str) {
         if self.cache_bytes <= self.max_cache_bytes {
@@ -252,5 +271,35 @@ mod tests {
         assert!(assets.get("x.png").is_some(), "sb/ 前缀变体");
         assert!(assets.get("y.png").is_some(), "根路径直命中");
         assert!(assets.get("z.png").is_none(), "缺失返回 None");
+    }
+
+    /// 上传后 discard:CPU 记账归零、再取可重新加载;缺失标记不受影响。
+    #[test]
+    fn discard_releases_and_reloads() {
+        let encode = || -> Vec<u8> {
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let mut table = std::collections::HashMap::new();
+        table.insert("x.png".to_string(), encode());
+        table.insert("y.png".to_string(), encode());
+        let mut assets = Assets::resolver(Box::new(move |logical| table.get(logical).cloned()));
+
+        assert!(assets.get("x.png").is_some());
+        assert!(assets.get("y.png").is_some());
+        assert_eq!(assets.cache_bytes, 2 * 2 * 2 * 4, "两张 2x2 RGBA 已缓存");
+        assets.discard("x.png");
+        assert_eq!(assets.cache_bytes, 2 * 2 * 4, "仅剩未丢弃的 y.png");
+        assert!(assets.get("x.png").is_some(), "丢弃后可重新加载(不被误标缺失)");
+
+        assets.get("z.png");
+        assert!(assets.cache.contains_key("z.png"), "缺失标记存在");
+        assets.discard("z.png"); // 防御:即使误调也不吞掉缺失标记
+        assert!(assets.get("z.png").is_none(), "缺失仍是缺失");
+        assert_eq!(assets.cache_bytes, 2 * (2 * 2 * 4), "记账未漂移");
     }
 }

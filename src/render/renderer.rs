@@ -40,6 +40,9 @@ pub struct Draw {
 struct Pipelines {
     normal: wgpu::RenderPipeline,
     additive: wgpu::RenderPipeline,
+    /// REPLACE 混合(无混合,直写):子矩形模式下用巨型透明四边形做
+    /// 区域清屏——整附件 LoadOp::Clear 会清掉图集其余内容,不可用。
+    clear: wgpu::RenderPipeline,
 }
 
 pub struct TextureSlot {
@@ -47,6 +50,8 @@ pub struct TextureSlot {
     pub texture: wgpu::Texture,
     pub bind_group: wgpu::BindGroup,
     pub size: [u32; 2],
+    /// GPU 占用字节(w*h*4),LRU 记账用。
+    pub bytes: usize,
 }
 
 pub struct Renderer {
@@ -72,6 +77,9 @@ pub struct Renderer {
     /// 帧计数,驱动 last_used 的 LRU 淘汰。
     frame: u64,
     last_used: HashMap<String, u64>,
+    /// 1×1 白纹理的绑定组:清屏四边形需要绑一个合法纹理(颜色 0 把
+    /// 采样值整体乘成 0,纹理内容无关紧要)。
+    dummy_bg: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -159,6 +167,32 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // 1×1 白纹理:子矩形模式的区域清屏四边形需要绑定一个纹理
+        let dummy = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("clear dummy"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            dummy.as_image_copy(),
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let dummy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("clear dummy bg"),
+            layout: &tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dummy.create_view(&Default::default())) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
         Renderer {
             device: device.clone(),
             queue: queue.clone(),
@@ -178,6 +212,7 @@ impl Renderer {
             max_gpu_bytes: usize::MAX,
             frame: 0,
             last_used: HashMap::new(),
+            dummy_bg,
         }
     }
 
@@ -205,12 +240,10 @@ impl Renderer {
                 px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
             }
         }
-        let img = &premult;
-        let (w, h) = img.dimensions();
-        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let (w, h) = premult.dimensions();
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(key),
-            size,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -218,7 +251,7 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        write_rgba(&self.queue, &texture, w, h, img.as_raw());
+        write_rgba(&self.queue, &texture, w, h, premult.as_raw());
         let view = texture.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(key),
@@ -228,8 +261,12 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        self.texture_bytes += (w * h * 4) as usize;
-        self.textures.insert(key.to_string(), TextureSlot { texture, bind_group, size: [w, h] });
+        let bytes = (w * h * 4) as usize;
+        self.texture_bytes += bytes;
+        self.textures.insert(
+            key.to_string(),
+            TextureSlot { texture, bind_group, size: [w, h], bytes },
+        );
     }
 
     /// 写入/更新一个外部逐帧纹理(视频通道):尺寸不变时原地
@@ -244,10 +281,11 @@ impl Renderer {
                 return false;
             }
             let old = self.textures.remove(key).unwrap();
-            self.texture_bytes -= (old.size[0] * old.size[1] * 4) as usize;
+            self.texture_bytes -= old.bytes;
             self.last_used.remove(key);
         }
         let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("frame size mismatch");
+        // 视频逐帧更新:每帧 CPU BC 编码代价过高,保持 RGBA 直传
         self.upload_texture(key, &img);
         true
     }
@@ -266,9 +304,13 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        self.textures.insert(key.to_string(), TextureSlot { texture, bind_group, size: [w, h] });
+        self.textures.insert(
+            key.to_string(),
+            TextureSlot { texture, bind_group, size: [w, h], bytes: (w * h * 4) as usize },
+        );
         replaced
     }
+
 
     pub fn texture(&self, key: &str) -> Option<&TextureSlot> {
         self.textures.get(key)
@@ -361,7 +403,9 @@ impl Renderer {
                     operation: wgpu::BlendOperation::Add,
                 },
             });
-            self.pipelines.insert(format, Pipelines { normal, additive });
+            // REPLACE(直写,无混合):区域清屏四边形用
+            let clear = make(wgpu::BlendState::REPLACE);
+            self.pipelines.insert(format, Pipelines { normal, additive, clear });
         }
     }
 
@@ -378,19 +422,61 @@ impl Renderer {
         draws: &[Draw],
         clear: [f64; 4],
     ) {
+        self.render_subrect(target, format, width, height, widescreen, draws, clear, None);
+    }
+
+    /// [`render`] 的子矩形版本:`subrect = Some((x,y,w,h))` 时把整个
+    /// 640×480 场景映射到目标纹理的该矩形(嵌入宿主直接渲进图集槽位,
+    /// 替代"独立纹理 + copy_into_atlas"的双份显存与每帧拷贝)。
+    ///
+    /// 子矩形模式不能整附件 Clear——LoadOp::Clear 会清掉图集其余内容
+    /// (字体/皮肤/背景),改用 Load + REPLACE 混合的巨型透明四边形做
+    /// 区域清屏;viewport 把 NDC 裁进矩形,投影矩阵与全幅模式一致,
+    /// 渲染结果与"全幅渲染后拷入矩形"逐像素等价。
+    pub fn render_subrect(
+        &mut self,
+        target: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        widescreen: bool,
+        draws: &[Draw],
+        clear: [f64; 4],
+        subrect: Option<(u32, u32, u32, u32)>,
+    ) {
         self.frame += 1;
-        for d in draws {
-            self.last_used.insert(d.texture.clone(), self.frame);
+        // LRU 记账仅在真有预算限制时进行:无限制(独立播放器)时,
+        // 每个 draw 一次 String clone + HashMap insert 是纯浪费
+        // (world.execute(me) 峰值 3.5K draw/帧)。
+        if self.max_gpu_bytes != usize::MAX {
+            for d in draws {
+                self.last_used.insert(d.texture.clone(), self.frame);
+            }
         }
         let globals = Globals { mvp: ortho_640x480(width, height, widescreen) };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         // 只保留贴图已就绪的 draw，保证实例索引对齐
-        let instances: Vec<GpuInstance> = draws
+        let mut instances: Vec<GpuInstance> = draws
             .iter()
             .filter(|d| self.textures.contains_key(&d.texture))
             .map(|d| d.instance)
             .collect();
+        // 子矩形模式:实例 0 为区域清屏四边形(覆盖全视口的透明 REPLACE)
+        if subrect.is_some() {
+            instances.insert(
+                0,
+                GpuInstance {
+                    pos: [320.0, 240.0],
+                    size: [100_000.0, 100_000.0], // 远超任何视口,出界部分被裁剪
+                    anchor: [0.5, 0.5],
+                    rotation: 0.0,
+                    color: [0.0, 0.0, 0.0, 0.0], // 颜色 0 → 输出恒为 (0,0,0,0)
+                    flip: [0.0, 0.0],
+                    _pad: [0.0; 3],
+                },
+            );
+        }
 
         let needed = instances.len() as u64;
         if needed > self.instance_cap {
@@ -416,12 +502,13 @@ impl Renderer {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                        // 子矩形模式必须保留图集其余内容,清屏交给 REPLACE 四边形
+                        load: if subrect.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color {
                             r: clear[0],
                             g: clear[1],
                             b: clear[2],
                             a: clear[3],
-                        }),
+                        }) },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -429,6 +516,9 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some((x, y, w, h)) = subrect {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            }
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_vertex_buffer(0, self.quad_vb.slice(..));
             // 绑定整个缓冲而非按实例数截断：实例数为 0 时空切片会让 wgpu panic
@@ -437,16 +527,40 @@ impl Renderer {
 
             let mut cur_additive: Option<bool> = None;
             let mut i: u32 = 0;
-            for d in draws {
-                let Some(slot) = self.textures.get(&d.texture) else { continue };
-                if cur_additive != Some(d.additive) {
-                    let pipe = if d.additive { &pipelines.additive } else { &pipelines.normal };
+            if subrect.is_some() {
+                pass.set_pipeline(&pipelines.clear);
+                pass.set_bind_group(1, &self.dummy_bg, &[]);
+                pass.draw_indexed(0..6, 0, 0..1);
+                i = 1;
+            }
+            // 连续同纹理 + 同混合模式的 draw 合并为一次实例化绘制:
+            // 绘制顺序、实例数据、管线切换时机与逐精灵绘制完全一致,
+            // 只是省掉重复的 set_bind_group/draw_indexed(wgpu 每次调用
+            // 都有验证与驱动开销;world.execute(me) 类生成式 SB 峰值
+            // 3505 个精灵仅 6 个 run)。
+            let mut idx = 0;
+            while idx < draws.len() {
+                let d = &draws[idx];
+                let Some(slot) = self.textures.get(&d.texture) else {
+                    idx += 1;
+                    continue;
+                };
+                let additive = d.additive;
+                if cur_additive != Some(additive) {
+                    let pipe = if additive { &pipelines.additive } else { &pipelines.normal };
                     pass.set_pipeline(pipe);
-                    cur_additive = Some(d.additive);
+                    cur_additive = Some(additive);
                 }
                 pass.set_bind_group(1, &slot.bind_group, &[]);
-                pass.draw_indexed(0..6, 0, i..i + 1);
-                i += 1;
+                let run_start = i;
+                while idx < draws.len()
+                    && draws[idx].additive == additive
+                    && draws[idx].texture == d.texture
+                {
+                    idx += 1;
+                    i += 1;
+                }
+                pass.draw_indexed(0..6, 0, run_start..i);
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -458,7 +572,7 @@ impl Renderer {
                 .textures
                 .iter()
                 .filter(|(k, _)| self.last_used.get(*k).copied().unwrap_or(0) < self.frame)
-                .map(|(k, slot)| (k.clone(), self.last_used.get(k).copied().unwrap_or(0), (slot.size[0] * slot.size[1] * 4) as usize))
+                .map(|(k, slot)| (k.clone(), self.last_used.get(k).copied().unwrap_or(0), slot.bytes))
                 .collect();
             candidates.sort_by_key(|(_, used, _)| *used);
             for (key, _, bytes) in candidates {
@@ -573,6 +687,8 @@ pub fn build_draws_filtered(
         if renderer.texture(&key).is_none() {
             if let Some(img) = assets.get(&key) {
                 renderer.upload_texture(&key, img);
+                // GPU 已持有该贴图:释放 CPU 解码副本,避免双驻留
+                assets.discard(&key);
             } else {
                 continue; // 缺贴图：跳过该精灵
             }
