@@ -1,6 +1,6 @@
 [package]
 name = "osu-storyboard-render"
-version = "0.1.1"
+version = "0.1.4"
 edition = "2021"
 description = "Render osu! storyboards (.osb / .osu Events) from source with wgpu"
 license = "MIT"
@@ -36,8 +36,3 @@ zip = { version = "2", default-features = false, features = ["deflate"], optiona
 
 [profile.dev]
 opt-level = 1
-
-# 本地 sibling checkout 接管同 URL git 依赖(与 osu-player 一致):
-# 开发期改 osu-parse 时 CLI 直接用本地未推送代码。
-[patch."https://github.com/Ohdmire/osu-parse.git"]
-osu-parse = { path = "../osu-parse" }
