@@ -227,6 +227,23 @@ impl Renderer {
         self.max_gpu_bytes = bytes;
     }
 
+    /// GPU 贴图是否受预算约束(存在 LRU 淘汰)。淘汰可能发生时上传后
+    /// 必须保留 CPU 解码副本:被淘汰贴图回归时从缓存重传即可,若副本
+    /// 已弃则要同步重走整张 PNG 解码,回归集中的一帧会明显卡顿。
+    pub fn gpu_budgeted(&self) -> bool {
+        self.max_gpu_bytes != usize::MAX
+    }
+
+    /// GPU 预算(字节;不限 = `usize::MAX`)。
+    pub fn gpu_budget(&self) -> usize {
+        self.max_gpu_bytes
+    }
+
+    /// 已驻留 GPU 的贴图字节合计(解码 RGBA 口径)。
+    pub fn texture_bytes(&self) -> usize {
+        self.texture_bytes
+    }
+
     pub fn upload_texture(&mut self, key: &str, img: &RgbaImage) {
         if self.textures.contains_key(key) {
             return;
@@ -695,6 +712,58 @@ pub fn build_draws(
 /// [`build_draws`] 的层过滤版本:嵌入宿主把 storyboard 拆到游戏画面上下
 /// 两侧时用(osu! 层序:Background/Fail/Pass 在游戏区之下,Foreground/
 /// Overlay 在其上)。`include` 对每个元素的层返回是否参与本次求值。
+/// 预取 storyboard 贴图:按元素起播时刻排序,把引用的贴图(动画展开
+/// 全部帧)解码并上传,直到 GPU 预算或 `deadline`。惰性加载下"整批
+/// 贴图首次可见"的那一帧要同步走完数百次解码+上传——帧动画式 SB
+/// (单拍激活几百张新贴图)首播卡一下、回看不卡的根因;预取后首播与
+/// 回看一致。超预算/超时未取到的贴图保持运行期惰性加载,行为不变。
+/// 返回本次实际上传的张数。
+pub fn prefetch_textures(
+    renderer: &mut Renderer,
+    assets: &mut Assets,
+    sb: &CompiledStoryboard,
+    deadline: Option<std::time::Instant>,
+) -> usize {
+    // (起播时刻, 逻辑路径):时间序保证时限内先备好最早登场的内容
+    let mut wanted: Vec<(f32, String)> = Vec::new();
+    for el in &sb.elements {
+        match &el.animation {
+            None => wanted.push((el.start, normalize_path(&el.path))),
+            Some(a) => {
+                for i in 0..a.frame_count.max(1) {
+                    wanted.push((el.start, normalize_path(&frame_path(&el.path, i as usize))));
+                }
+            }
+        }
+    }
+    wanted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let budget = renderer.gpu_budget();
+    let mut uploaded = 0;
+    for (_, key) in &wanted {
+        if renderer.texture(&key).is_some() {
+            continue;
+        }
+        if renderer.texture_bytes() >= budget {
+            break;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if let Some(img) = assets.get(key) {
+            renderer.upload_texture(key, img);
+            // 与 build_draws_filtered 同策略:无淘汰可能时 CPU 副本纯浪费
+            if !renderer.gpu_budgeted() {
+                assets.discard(key);
+            }
+            uploaded += 1;
+        }
+    }
+    uploaded
+}
+
+/// [`build_draws`] 的层过滤版本:嵌入宿主把 storyboard 拆到游戏画面上下
+/// 两侧时用(osu! 层序:Background/Fail/Pass 在游戏区之下,Foreground/
+/// Overlay 在其上)。`include` 对每个元素的层返回是否参与本次求值。
 pub fn build_draws_filtered(
     renderer: &mut Renderer,
     assets: &mut Assets,
@@ -727,8 +796,13 @@ pub fn build_draws_filtered(
         if renderer.texture(&key).is_none() {
             if let Some(img) = assets.get(&key) {
                 renderer.upload_texture(&key, img);
-                // GPU 已持有该贴图:释放 CPU 解码副本,避免双驻留
-                assets.discard(&key);
+                // 无预算限制时 GPU 永不淘汰,CPU 副本是纯双驻留,上传后
+                // 即弃;有预算时保留副本,LRU 淘汰后的回归从缓存重传,
+                // 避免整批同步重解码造成的单帧卡顿(CPU 侧另有
+                // SB_CACHE_MB 预算管内存)。
+                if !renderer.gpu_budgeted() {
+                    assets.discard(&key);
+                }
             } else {
                 continue; // 缺贴图：跳过该精灵
             }
