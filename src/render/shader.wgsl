@@ -27,15 +27,20 @@ struct VertexOut {
 fn vs(v: VertexIn) -> VertexOut {
     let px = v.corner * v.size;
     let anchor_px = v.anchor * v.size;
-    let f = vec2<f32>(1.0, 1.0) - 2.0 * v.flip;
-    let d = (px - anchor_px) * f;
+    let d = px - anchor_px;
     // osu! 正角度为顺时针（y 向下坐标系下的标准旋转矩阵）
     let c = cos(v.rotation);
     let s = sin(v.rotation);
     let dr = vec2<f32>(d.x * c - d.y * s, d.x * s + d.y * c);
     let world = v.pos + dr;
+    // flip 语义(lazer DrawableStoryboardSprite: DrawScale 取负 + AdjustOrigin
+    // 把 origin 翻到对侧边缘)——两者抵消:四边形保持原位不动,仅纹理在
+    // 矩形内整幅镜像。因此几何不镜像、UV 按轴整幅镜像。若几何也镜像,
+    // 精灵会跳到 origin 另一侧(My Love 黑幕面板"位置错误"的根因);若 UV
+    // 绕 anchor 镜像,边缘锚点(TopCentre 等)UV 越界 [1,2] 被钳到边缘,
+    // 整张精灵塌成一条拉伸的边缘纹素(实心色块,柔边全失)。
     var uv = px / v.size;
-    uv = mix(uv, 2.0 * v.anchor - uv, v.flip);
+    uv = mix(uv, 1.0 - uv, v.flip);
     var out: VertexOut;
     out.position = globals.mvp * vec4<f32>(world, 0.0, 1.0);
     out.uv = uv;

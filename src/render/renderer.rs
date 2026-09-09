@@ -34,6 +34,10 @@ struct Globals {
 pub struct Draw {
     pub texture: String,
     pub additive: bool,
+    /// 该精灵的暗度预乘(1.0 = 不衰减)。lazer `UserDimContainer` 把
+    /// DimLevel 以 Gray(1-dim) 乘在故事板内容上(含 Overlay 代理),跟随
+    /// 背景亮度滑块实时变化。
+    pub dim: f32,
     pub instance: GpuInstance,
 }
 
@@ -453,7 +457,7 @@ impl Renderer {
                 self.last_used.insert(d.texture.clone(), self.frame);
             }
         }
-        let globals = Globals { mvp: ortho_640x480(width, height, widescreen) };
+        let globals = Globals { mvp: ortho_640x480(width, height) };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         // 只保留贴图已就绪的 draw，保证实例索引对齐
@@ -462,6 +466,16 @@ impl Renderer {
             .filter(|d| self.textures.contains_key(&d.texture))
             .map(|d| d.instance)
             .collect();
+        if std::env::var("SB_DEBUG_PASS").is_ok() {
+            eprintln!(
+                "[sb-pass] subrect={subrect:?} draws={} included={} tex_bytes={} textures={}",
+                draws.len(),
+                instances.len(),
+                self.texture_bytes,
+                self.textures.len()
+            );
+        }
+
         // 子矩形模式:实例 0 为区域清屏四边形(覆盖全视口的透明 REPLACE)
         if subrect.is_some() {
             instances.insert(
@@ -532,6 +546,15 @@ impl Renderer {
                 pass.set_bind_group(1, &self.dummy_bg, &[]);
                 pass.draw_indexed(0..6, 0, 0..1);
                 i = 1;
+            }
+            // 非宽屏故事板容器遮罩(lazer StoryboardLayer.Masking):精灵
+            // 一律裁剪到居中的 640×480 容器,容器外的屏幕区域保持透明,
+            // 由宿主透出谱面背景。清除四边形在遮罩之前执行(整槽清透)。
+            if !widescreen {
+                let (vx, vy, vw, vh) =
+                    subrect.map_or((0, 0, width, height), |(x, y, w, h)| (x, y, w, h));
+                let (mx, my, mw, mh) = container_mask_rect(vx, vy, vw, vh);
+                pass.set_scissor_rect(mx, my, mw, mh);
             }
             // 连续同纹理 + 同混合模式的 draw 合并为一次实例化绘制:
             // 绘制顺序、实例数据、管线切换时机与逐精灵绘制完全一致,
@@ -622,11 +645,15 @@ fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, w: u32, h: u32, rgba
     );
 }
 
-/// 640x480 正交投影：高固定 480；widescreen 时宽按目标纵横比向两侧扩展，
-/// 否则固定 4:3 宽度（宽窗口两侧黑边，与 osu! 非宽屏谱面行为一致）。
-fn ortho_640x480(width: u32, height: u32, widescreen: bool) -> [f32; 16] {
+/// 640x480 正交投影：高固定 480,宽按**目标纵横比**向两侧扩展(始终以
+/// [320±240×aspect] 为可视世界窗)。宽屏与否不再改变投影——lazer
+/// `DrawableStoryboard` 的容器两种都是同一缩放(ScreenH/480)居中,宽屏
+/// 标志只决定容器宽度(853 或 640 单位)进而决定 Masking 裁剪范围,
+/// 由 render_subrect 的 scissor 实现。此前非宽屏把 640 单位拉满整屏宽,
+/// 造成 4:3 故事板被水平拉宽。
+fn ortho_640x480(width: u32, height: u32) -> [f32; 16] {
     let aspect = if height == 0 { 4.0 / 3.0 } else { width as f32 / height as f32 };
-    let view_w = if widescreen { OSU_HEIGHT * aspect } else { OSU_HEIGHT * 4.0 / 3.0 };
+    let view_w = OSU_HEIGHT * aspect;
     let x0 = OSU_CENTRE_X - view_w / 2.0;
     let x1 = OSU_CENTRE_X + view_w / 2.0;
     let sx = 2.0 / (x1 - x0);
@@ -642,6 +669,18 @@ fn ortho_640x480(width: u32, height: u32, widescreen: bool) -> [f32; 16] {
     ]
 }
 
+/// 非宽屏故事板的容器遮罩(中央 4:3)在视口内的像素矩形。lazer
+/// `StoryboardLayer.Masking = true`:精灵一律裁剪到容器内(宽屏容器
+/// 853×480、非宽屏 640×480,均居中;前者在 16:9 视口下恰好全覆盖,
+/// 故只需对非宽屏裁剪)。返回 (x, y, w, h)。
+fn container_mask_rect(vx: u32, vy: u32, vw: u32, vh: u32) -> (u32, u32, u32, u32) {
+    let aspect = vw as f32 / vh.max(1) as f32;
+    let frac = (4.0 / 3.0 / aspect).min(1.0);
+    let mw = (vw as f32 * frac).floor() as u32;
+    let mx = vx + (vw - mw) / 2;
+    (mx, vy, mw, vh)
+}
+
 /// 求值时刻 t 的全部可见精灵并填充贴图，返回按绘制顺序排列的 Draw 列表。
 pub fn build_draws(
     renderer: &mut Renderer,
@@ -650,7 +689,7 @@ pub fn build_draws(
     t: f32,
     fail: FailState,
 ) -> Vec<Draw> {
-    build_draws_filtered(renderer, assets, sb, t, fail, |_| true)
+    build_draws_filtered(renderer, assets, sb, t, fail, 1.0, |_| true)
 }
 
 /// [`build_draws`] 的层过滤版本:嵌入宿主把 storyboard 拆到游戏画面上下
@@ -662,6 +701,7 @@ pub fn build_draws_filtered(
     sb: &CompiledStoryboard,
     t: f32,
     fail: FailState,
+    dim: f32,
     include: impl Fn(&Layer) -> bool,
 ) -> Vec<Draw> {
     let mut out = Vec::new();
@@ -695,18 +735,33 @@ pub fn build_draws_filtered(
         }
         let Some(slot) = renderer.texture(&key) else { continue };
         let [tw, th] = slot.size;
+        // 暗度统一生效:lazer 的 Overlay 层虽被代理到物件上方,但其
+        // 绘制继承 dimContent 的 FadeColour(Gray(1-dim)),同样衰减。
+        let dim = dim;
+        if std::env::var("SB_DEBUG_DRAWS").is_ok() {
+            eprintln!(
+                "[sb-draw] {key} pos=({:.0},{:.0}) size=({:.0}x{:.0}) rot={:.2} color=({:.2},{:.2},{:.2},{:.2}) add={} dim={:.2}",
+                st.x, st.y, tw as f32 * st.scale_x, th as f32 * st.scale_y, st.rotation,
+                st.colour[0], st.colour[1], st.colour[2], st.alpha, st.additive, dim
+            );
+        }
+        let mut inst = GpuInstance {
+            pos: [st.x, st.y],
+            size: [tw as f32 * st.scale_x, th as f32 * st.scale_y],
+            anchor: el.origin.anchor(),
+            rotation: st.rotation,
+            color: [st.colour[0], st.colour[1], st.colour[2], st.alpha],
+            flip: [st.flip_h as u32 as f32, st.flip_v as u32 as f32],
+            _pad: [0.0; 3],
+        };
+        inst.color[0] *= dim;
+        inst.color[1] *= dim;
+        inst.color[2] *= dim;
         out.push(Draw {
             texture: key,
             additive: st.additive,
-            instance: GpuInstance {
-                pos: [st.x, st.y],
-                size: [tw as f32 * st.scale_x, th as f32 * st.scale_y],
-                anchor: el.origin.anchor(),
-                rotation: st.rotation,
-                color: [st.colour[0], st.colour[1], st.colour[2], st.alpha],
-                flip: [st.flip_h as u32 as f32, st.flip_v as u32 as f32],
-                _pad: [0.0; 3],
-            },
+            dim,
+            instance: inst,
         });
     }
     out
@@ -719,7 +774,7 @@ mod tests {
     #[test]
     fn ortho_maps_corners() {
         // 4:3 → x 覆盖 0..640，y 覆盖 0..480
-        let m = ortho_640x480(800, 600, true);
+        let m = ortho_640x480(800, 600);
         let apply = |m: &[f32; 16], x: f32, y: f32| {
             // 列主序矩阵乘法
             let cx = m[0] * x + m[4] * y + m[12];
@@ -734,17 +789,25 @@ mod tests {
         assert!(x.abs() < 1e-4);
 
         // 16:9 → 可见宽度 853.33px，640px 位于 (640-(-106.67))/853.33*2-1 = 0.75
-        let m = ortho_640x480(1600, 900, true);
+        let m = ortho_640x480(1600, 900);
         let [x, _] = apply(&m, 640.0, 240.0);
-        assert!((x - 0.75).abs() < 1e-3, "widescreen 下 640px 应映射到 0.75: {x}");
+        assert!((x - 0.75).abs() < 1e-3, "16:9 下 640px 应映射到 0.75: {x}");
         let [x, _] = apply(&m, 320.0, 240.0);
         assert!(x.abs() < 1e-3, "中心仍在原点: {x}");
-
-        // 非宽屏：16:9 窗口下 0..640 仍铺满整个宽度（4:3 区域居中，两侧黑边）
-        let m = ortho_640x480(1600, 900, false);
+        // 投影不再区分宽屏:0..640 不再铺满 16:9 全宽,而是居中的 75%
         let [x, _] = apply(&m, 0.0, 240.0);
-        assert!((x + 1.0).abs() < 1e-3, "x=0 仍在左缘: {x}");
-        let [x, _] = apply(&m, 640.0, 240.0);
-        assert!((x - 1.0).abs() < 1e-3, "x=640 仍在右缘: {x}");
+        assert!((x + 0.75).abs() < 1e-3, "x=0 应映射到 -0.75(中央 4:3 左缘): {x}");
+    }
+
+    #[test]
+    fn mask_is_central_43_on_widescreen_viewport() {
+        // 16:9 视口:容器占中央 75% 宽
+        let (mx, my, mw, mh) = container_mask_rect(0, 0, 1920, 1080);
+        assert_eq!((mx, my, mw, mh), (240, 0, 1440, 1080));
+        // 4:3 视口:容器铺满,遮罩为全视口
+        assert_eq!(container_mask_rect(0, 0, 1440, 1080), (0, 0, 1440, 1080));
+        // 带偏移的子矩形
+        let (mx, my, mw, mh) = container_mask_rect(100, 50, 1920, 1080);
+        assert_eq!((mx, my, mw, mh), (340, 50, 1440, 1080));
     }
 }
