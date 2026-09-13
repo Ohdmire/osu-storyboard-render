@@ -30,6 +30,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 log = "0.4"
 pollster = "0.4"
 wgpu = "25"
+# 实时超分(WGSL compute,MIT):FSR/Anime4K,视频帧与 BG 放大(经 upscale 模块)。
+anime4k-wgpu = { git = "https://github.com/SegaraRai/anime4k-wgpu.git" }
 env_logger = { version = "0.11", default-features = false, optional = true }
 winit = { version = "0.30", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }

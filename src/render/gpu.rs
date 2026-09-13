@@ -33,9 +33,16 @@ impl GpuContext {
             adapter.get_info().name,
             adapter.get_info().backend
         );
+        // Anime4K 超分链把 R32F 中间纹理按可过滤采样绑定:适配器支持时
+        // 开启 FLOAT32_FILTERABLE(桌面 NVIDIA/AMD/Intel 均支持)。
+        let mut features = wgpu::Features::empty();
+        if adapter.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+            features |= wgpu::Features::FLOAT32_FILTERABLE;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("osu-storyboard-render device"),
+                required_features: features,
                 ..Default::default()
             },
         ))?;

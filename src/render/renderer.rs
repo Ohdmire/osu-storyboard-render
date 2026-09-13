@@ -84,6 +84,15 @@ pub struct Renderer {
     /// 1×1 白纹理的绑定组:清屏四边形需要绑一个合法纹理(颜色 0 把
     /// 采样值整体乘成 0,纹理内容无关紧要)。
     dummy_bg: wgpu::BindGroup,
+    /// 视频通道超分(None = 关):原帧先上常驻 staging 纹理,经
+    /// [`Upscaler`] 放大后以 `set_frame_texture` 换入视频槽位。
+    upscale: Option<crate::render::upscale::Upscaler>,
+    /// 超分目标尺寸(SB 合成槽分辨率,视频精灵的最终采样分辨率)。
+    upscale_target: (u32, u32),
+    /// 视频原帧的常驻 staging 纹理(尺寸随视频变化重建)。
+    video_staging: Option<wgpu::Texture>,
+    /// 上次换绑视频槽位时的超分代数(输出纹理重建检测)。
+    video_upscale_gen_seen: u64,
 }
 
 impl Renderer {
@@ -217,6 +226,30 @@ impl Renderer {
             frame: 0,
             last_used: HashMap::new(),
             dummy_bg,
+            upscale: None,
+            upscale_target: (0, 0),
+            video_staging: None,
+            video_upscale_gen_seen: u64::MAX,
+        }
+    }
+
+    /// 视频通道超分开关与目标尺寸(`target` = SB 合成槽分辨率:放大后
+    /// 的视频纹理以该分辨率进入合成,替代合成器内部的线性拉伸)。
+    /// Off 时恢复原帧直传。模式/目标变更即时生效,无需重载。
+    pub fn set_video_upscale(
+        &mut self,
+        mode: crate::render::upscale::UpscaleMode,
+        target: (u32, u32),
+    ) {
+        use crate::render::upscale::{UpscaleMode, Upscaler};
+        self.upscale_target = target;
+        match mode {
+            UpscaleMode::Off => self.upscale = None,
+            m => {
+                if self.upscale.as_ref().is_none_or(|u| u.mode() != m) {
+                    self.upscale = Some(Upscaler::new(&self.device, &self.queue, m));
+                }
+            }
         }
     }
 
@@ -293,9 +326,45 @@ impl Renderer {
     /// 写入/更新一个外部逐帧纹理(视频通道):尺寸不变时原地
     /// write_texture,变化时重建纹理与绑定组。内容为 RGBA 行主序。
     /// 返回是否新建了纹理(首帧)。不走 LRU 记账——视频纹理常驻,
-    /// 只有一帧的量。
+    /// 只有一帧的量。开启超分时:原帧先上常驻 staging,跑 FSR/Anime4K
+    /// 链放大到 `upscale_target`,再以 GPU 纹理换入视频槽位。
     pub fn write_frame(&mut self, key: &str, w: u32, h: u32, rgba: &[u8]) -> bool {
         debug_assert_eq!(rgba.len(), (w * h * 4) as usize);
+        if self.upscale.is_some() {
+            let target = self.upscale_target;
+            if target.0 > 0 && target.1 > 0 && w > 0 && h > 0 && (w, h) != target {
+                // 常驻 staging(Anime4K 执行器绑定源纹理,必须同一张)
+                if self.video_staging.as_ref().is_none_or(|t| t.width() != w || t.height() != h) {
+                    self.video_staging = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("video upscale staging"),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    }));
+                }
+                let staging = self.video_staging.as_ref().unwrap();
+                write_rgba(&self.queue, staging, w, h, rgba);
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("video upscale"),
+                });
+                let (out, gen) = {
+                    let up = self.upscale.as_mut().unwrap();
+                    (up.process(&mut encoder, staging, target), up.generation())
+                };
+                self.queue.submit([encoder.finish()]);
+                // 输出纹理按尺寸复用:代数未变 = 槽位仍绑同一张,逐帧
+                // 零重绑(compute 原地更新内容)
+                if gen == self.video_upscale_gen_seen && self.textures.contains_key(key) {
+                    return false;
+                }
+                self.video_upscale_gen_seen = gen;
+                return self.set_frame_texture(key, out, target.0, target.1);
+            }
+        }
         if let Some(slot) = self.textures.get(key) {
             if slot.size == [w, h] {
                 write_rgba(&self.queue, &slot.texture, w, h, rgba);
