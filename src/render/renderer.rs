@@ -332,7 +332,10 @@ impl Renderer {
         debug_assert_eq!(rgba.len(), (w * h * 4) as usize);
         if self.upscale.is_some() {
             let target = self.upscale_target;
-            if target.0 > 0 && target.1 > 0 && w > 0 && h > 0 && (w, h) != target {
+            // 源尺寸 = 目标尺寸也执行:Anime4K 的重建/去噪与 FSR 的 RCAS
+            // 锐化在 1:1 下正是主要收益(曾经此处跳过同尺寸,表现为
+            // "开了超分没效果")
+            if target.0 > 0 && target.1 > 0 && w > 0 && h > 0 {
                 // 常驻 staging(Anime4K 执行器绑定源纹理,必须同一张)
                 if self.video_staging.as_ref().is_none_or(|t| t.width() != w || t.height() != h) {
                     self.video_staging = Some(self.device.create_texture(&wgpu::TextureDescriptor {

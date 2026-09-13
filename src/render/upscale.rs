@@ -19,20 +19,34 @@ use anime4k_wgpu::presets::{Anime4KPerformancePreset, Anime4KPreset};
 
 const WORKGROUP: u32 = 8;
 
-/// 超分算法选择。
+/// 超分算法选择。Anime4K 三条链(lively/Anime4K 的 Mode):
+/// A 锐利重建(动漫线条)、B 柔和恢复、C 放大+降噪(压缩噪声视频最稳)。
+/// 与分辨率无关 —— 源尺寸 = 目标尺寸时同样执行(restore/锐化在 1:1
+/// 下正是主要收益),见 [`Upscaler::process`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpscaleMode {
     #[default]
     Off,
     Fsr1,
-    Anime4K,
+    Anime4K(A4kMode),
+}
+
+/// Anime4K 链变体(bloc97 Mode A/B/C,Medium 模型)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum A4kMode {
+    #[default]
+    A,
+    B,
+    C,
 }
 
 impl UpscaleMode {
     pub fn parse(s: &str) -> UpscaleMode {
         match s {
             "fsr" | "fsr1" => UpscaleMode::Fsr1,
-            "anime4k" => UpscaleMode::Anime4K,
+            "anime4k" | "anime4k-a" => UpscaleMode::Anime4K(A4kMode::A),
+            "anime4k-b" => UpscaleMode::Anime4K(A4kMode::B),
+            "anime4k-c" => UpscaleMode::Anime4K(A4kMode::C),
             _ => UpscaleMode::Off,
         }
     }
@@ -41,7 +55,9 @@ impl UpscaleMode {
         match self {
             UpscaleMode::Off => "off",
             UpscaleMode::Fsr1 => "fsr",
-            UpscaleMode::Anime4K => "anime4k",
+            UpscaleMode::Anime4K(A4kMode::A) => "anime4k-a",
+            UpscaleMode::Anime4K(A4kMode::B) => "anime4k-b",
+            UpscaleMode::Anime4K(A4kMode::C) => "anime4k-c",
         }
     }
 }
@@ -339,7 +355,7 @@ impl Upscaler {
                 }
             }
             UpscaleMode::Fsr1 => self.run_fsr(encoder, source, &out, dst),
-            UpscaleMode::Anime4K => self.run_a4k(encoder, source, &out, dst),
+            UpscaleMode::Anime4K(_) => self.run_a4k(encoder, source, &out, dst),
         }
         self.out = Some(out);
         tex
@@ -412,11 +428,18 @@ impl Upscaler {
         dst: (u32, u32),
     ) {
         let src_size = (source.width(), source.height());
+        let variant = match self.mode {
+            UpscaleMode::Anime4K(v) => v,
+            _ => unreachable!(),
+        };
         if self.a4k.as_ref().is_none_or(|s| s.src_size != src_size) {
-            // Mode C(Upscale+Denoise)Medium:带压缩噪声的动漫视频最稳;
-            // 2× 整数链,scale pass 收尾到目标尺寸
-            let pipelines = Anime4KPreset::ModeC
-                .create_pipelines(Anime4KPerformancePreset::Medium, 2.0);
+            // 2× 整数链(CNN 重建+放大),scale pass 收尾到目标尺寸
+            let preset = match variant {
+                A4kMode::A => Anime4KPreset::ModeA,
+                A4kMode::B => Anime4KPreset::ModeB,
+                A4kMode::C => Anime4KPreset::ModeC,
+            };
+            let pipelines = preset.create_pipelines(Anime4KPerformancePreset::Medium, 2.0);
             let (executor, out2x) = PipelineExecutor::new(&pipelines, &self.device, source);
             self.a4k = Some(A4kState { executor, out2x, src_size });
         }
@@ -480,18 +503,21 @@ impl Upscaler {
 }
 
 /// 静态图像一次性放大(BG 载入期):上传 → 超分 → 回读,返回目标尺寸
-/// 的 CPU 图像。`Off`、已达目标尺寸或零尺寸时原样克隆返回。
-/// 临时 GPU 资源(Anime4K 的 32F 中间纹理)随调用结束释放。
-pub fn upscale_image(
+/// 的 `(宽, 高, RGBA)`。`Off`、已达目标尺寸或零尺寸时原样返回输入
+/// 字节。临时 GPU 资源(Anime4K 的 32F 中间纹理)随调用结束释放。
+/// 裸字节接口:调用方无需依赖 `image` crate。
+pub fn upscale_image<'a>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    img: &image::RgbaImage,
+    src: (u32, u32, &'a [u8]),
     mode: UpscaleMode,
     target: (u32, u32),
-) -> image::RgbaImage {
-    let (w, h) = img.dimensions();
-    if mode == UpscaleMode::Off || w == 0 || h == 0 || (w >= target.0 && h >= target.1) || target.0 == 0 || target.1 == 0 {
-        return img.clone();
+) -> (u32, u32, std::borrow::Cow<'a, [u8]>) {
+    let (w, h, rgba) = src;
+    // 严格大于目标才跳过(超大图经上采样链降采样无意义);等尺寸执行
+    // —— restore/锐化正是 1:1 下的主要收益
+    if mode == UpscaleMode::Off || w == 0 || h == 0 || w > target.0 || h > target.1 || target.0 == 0 || target.1 == 0 {
+        return (w, h, std::borrow::Cow::Borrowed(rgba));
     }
     let staging = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("upscale_image staging"),
@@ -505,7 +531,7 @@ pub fn upscale_image(
     });
     queue.write_texture(
         wgpu::ImageCopyTexture { texture: &staging, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        img.as_raw(),
+        rgba,
         wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
         wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     );
@@ -536,7 +562,7 @@ pub fn upscale_image(
         buf.unmap();
         data
     };
-    image::RgbaImage::from_raw(target.0, target.1, out).expect("upscaled size mismatch")
+    (target.0, target.1, std::borrow::Cow::Owned(out))
 }
 
 #[cfg(test)]
@@ -585,6 +611,17 @@ mod tests {
         image::imageops::resize(src, tw, th, image::imageops::FilterType::Triangle)
     }
 
+    fn upscale_to_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &image::RgbaImage,
+        mode: UpscaleMode,
+        dst: (u32, u32),
+    ) -> image::RgbaImage {
+        let (w, h, bytes) = upscale_image(device, queue, (src.width(), src.height(), src.as_raw()), mode, dst);
+        image::RgbaImage::from_raw(w, h, bytes.into_owned()).expect("size")
+    }
+
     /// FSR 与 Anime4K 都能跑通:输出尺寸正确、alpha=1、内容与双线性
     /// 参考同量级(超分是重建不是复制,均值差在合理带宽内)。
     #[test]
@@ -593,8 +630,8 @@ mod tests {
         let src = gradient(320, 180);
         let dst = (640, 360);
         let reference = reference_downscale(&src, dst.0, dst.1);
-        for mode in [UpscaleMode::Fsr1, UpscaleMode::Anime4K] {
-            let out = upscale_image(&device, &queue, &src, mode, dst);
+        for mode in [UpscaleMode::Fsr1, UpscaleMode::Anime4K(A4kMode::A), UpscaleMode::Anime4K(A4kMode::C)] {
+            let out = upscale_to_image(&device, &queue, &src, mode, dst);
             assert_eq!(out.dimensions(), dst, "{mode:?} 尺寸错误");
             assert!(out.pixels().all(|p| p[3] == 255), "{mode:?} alpha 应恒 1");
             let err = mean_abs_err(&out, &reference);
@@ -603,15 +640,22 @@ mod tests {
         }
     }
 
-    /// Off / 已达目标尺寸:原样返回(像素级一致)。
+    /// Off 原样返回(字节一致);严格大于目标跳过;同尺寸执行
+    /// (尺寸不变、字节被重建过)。
     #[test]
     fn upscale_image_passthrough_cases() {
         let (device, queue) = gpu();
         let src = gradient(64, 64);
-        assert_eq!(upscale_image(&device, &queue, &src, UpscaleMode::Off, (128, 128)).dimensions(), (64, 64));
-        let same = upscale_image(&device, &queue, &src, UpscaleMode::Fsr1, (64, 64));
-        assert_eq!(same.dimensions(), (64, 64));
-        assert!(same.pixels().zip(src.pixels()).all(|(a, b)| a == b));
+        let (w, h, b) = upscale_image(&device, &queue, (64, 64, src.as_raw()), UpscaleMode::Off, (128, 128));
+        assert_eq!((w, h), (64, 64));
+        assert!(b.iter().eq(src.as_raw().iter()));
+        // 严格大于目标(128 > 64):跳过,原样返回
+        let (w, h, b) = upscale_image(&device, &queue, (128, 128, vec![128u8; 128 * 128 * 4].as_slice()), UpscaleMode::Fsr1, (64, 64));
+        assert_eq!((w, h), (128, 128));
+        // 同尺寸:执行链(尺寸不变、内容被重建 —— 字节应有所变化)
+        let (w, h, b) = upscale_image(&device, &queue, (64, 64, src.as_raw()), UpscaleMode::Fsr1, (64, 64));
+        assert_eq!((w, h), (64, 64));
+        assert!(!b.iter().eq(src.as_raw().iter()), "同尺寸应执行重建(字节变化)");
     }
 
     /// Upscaler 逐帧复用:同尺寸连续 process 不重建(代数不变),尺寸
