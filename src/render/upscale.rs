@@ -607,7 +607,13 @@ pub fn upscale_image<'a>(
     let out = {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upscale_image") });
         let out = up.process(&mut encoder, &staging, target);
-        let byte_len = (target.0 * target.1 * 4) as u64;
+        // 回读行距必须 256 字节对齐(wgpu COPY_BYTES_PER_ROW_ALIGNMENT):
+        // 奇数宽度(如 1366→2561 的等比例覆盖)×4 不对齐,曾经直接校验
+        // 错误 → 未捕获即致命。按对齐行距拷贝,读回后去行填充。
+        const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let bpr = target.0 * 4;
+        let bpr_aligned = bpr.div_ceil(ALIGN) * ALIGN;
+        let byte_len = bpr_aligned as u64 * target.1 as u64;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("upscale_image readback"),
             size: byte_len,
@@ -616,7 +622,7 @@ pub fn upscale_image<'a>(
         });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture { texture: &out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(target.0 * 4), rows_per_image: Some(target.1) } },
+            wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr_aligned), rows_per_image: Some(target.1) } },
             wgpu::Extent3d { width: target.0, height: target.1, depth_or_array_layers: 1 },
         );
         queue.submit([encoder.finish()]);
@@ -628,7 +634,16 @@ pub fn upscale_image<'a>(
             mapped.to_vec()
         };
         buf.unmap();
-        data
+        if bpr_aligned == bpr {
+            data
+        } else {
+            // 去除行尾填充,收紧为紧密 RGBA
+            let mut tight = Vec::with_capacity((bpr * target.1) as usize);
+            for row in data.chunks_exact(bpr_aligned as usize) {
+                tight.extend_from_slice(&row[..bpr as usize]);
+            }
+            tight
+        }
     };
     (target.0, target.1, std::borrow::Cow::Owned(out))
 }
@@ -706,6 +721,23 @@ mod tests {
             // 渐变图上超分与双线性参考的均值差远小于信号摆幅(255)
             assert!(err < 24.0, "{mode:?} 输出与参考偏差过大: {err}");
         }
+    }
+
+    /// 回归:奇数宽度目标(如 1366×768 的等比例覆盖 2561×1440)行距
+    /// ×4 不满足 256 字节对齐 —— 曾经 copy_texture_to_buffer 校验错误
+    /// 直接致命。现在必须无错完成且内容与参考同量级。
+    #[test]
+    fn upscale_odd_width_target_aligned_readback() {
+        let (device, queue) = gpu();
+        let src = gradient(500, 281);
+        // 1366×4=5464,5464%256=88 → 未对齐路径
+        let (w, h, bytes) = upscale_image(&device, &queue, (500, 281, src.as_raw()), UpscaleMode::Fsr1, (1366, 768));
+        assert_eq!((w, h), (1366, 768));
+        assert_eq!(bytes.len(), (1366 * 768 * 4) as usize, "回读须为紧密 RGBA(无行填充)");
+        let img = image::RgbaImage::from_raw(w, h, bytes.into_owned()).expect("size");
+        let reference = reference_downscale(&src, w, h);
+        let err = mean_abs_err(&img, &reference);
+        assert!(err < 24.0, "奇宽目标输出偏差过大: {err}");
     }
 
     /// Off 原样返回(字节一致);严格大于目标跳过;同尺寸执行
