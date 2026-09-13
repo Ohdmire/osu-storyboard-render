@@ -247,6 +247,10 @@ impl Renderer {
         use crate::render::upscale::{UpscaleMode, Upscaler};
         self.upscale_target = target;
         self.video_upscale_logged = false;
+        // 新 Upscaler 的代数从 0 重新计:不复位 seen 的话,旧值恰好相等时
+        // 会被误判"输出纹理未变"而跳过重绑 —— 视频槽位继续采样已被
+        // 丢弃的旧输出纹理(不再更新),画面冻在最后一帧
+        self.video_upscale_gen_seen = u64::MAX;
         match mode {
             UpscaleMode::Off => self.upscale = None,
             m => {
