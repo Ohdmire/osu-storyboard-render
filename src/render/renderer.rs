@@ -93,6 +93,8 @@ pub struct Renderer {
     video_staging: Option<wgpu::Texture>,
     /// 上次换绑视频槽位时的超分代数(输出纹理重建检测)。
     video_upscale_gen_seen: u64,
+    /// 视频超分配置日志只打一次(尺寸/模式变化时重置)。
+    video_upscale_logged: bool,
 }
 
 impl Renderer {
@@ -230,6 +232,7 @@ impl Renderer {
             upscale_target: (0, 0),
             video_staging: None,
             video_upscale_gen_seen: u64::MAX,
+            video_upscale_logged: false,
         }
     }
 
@@ -243,6 +246,7 @@ impl Renderer {
     ) {
         use crate::render::upscale::{UpscaleMode, Upscaler};
         self.upscale_target = target;
+        self.video_upscale_logged = false;
         match mode {
             UpscaleMode::Off => self.upscale = None,
             m => {
@@ -251,6 +255,7 @@ impl Renderer {
                 }
             }
         }
+        log::info!("[video-upscale] 配置: {:?} → 槽位 {}x{}", mode, target.0, target.1);
     }
 
     /// GPU 贴图内存预算(字节):超出后 LRU 淘汰未在本帧使用的贴图槽,
@@ -331,11 +336,26 @@ impl Renderer {
     pub fn write_frame(&mut self, key: &str, w: u32, h: u32, rgba: &[u8]) -> bool {
         debug_assert_eq!(rgba.len(), (w * h * 4) as usize);
         if self.upscale.is_some() {
-            let target = self.upscale_target;
+            let slot = self.upscale_target;
+            // 目标保持源宽高比(宽向贴合槽位):非 16:9 视频不被拉伸,
+            // 精灵变换按原几何映射,纹理只是更精细
+            let target = if w > 0 && h > 0 {
+                (slot.0, ((slot.0 as f64 * h as f64 / w as f64).round() as u32).max(1))
+            } else {
+                slot
+            };
             // 源尺寸 = 目标尺寸也执行:Anime4K 的重建/去噪与 FSR 的 RCAS
             // 锐化在 1:1 下正是主要收益(曾经此处跳过同尺寸,表现为
             // "开了超分没效果")
             if target.0 > 0 && target.1 > 0 && w > 0 && h > 0 {
+                if !self.video_upscale_logged {
+                    self.video_upscale_logged = true;
+                    log::info!(
+                        "[video-upscale] {:?}: {}x{} → {}x{}",
+                        self.upscale.as_ref().map(|u| u.mode()),
+                        w, h, target.0, target.1
+                    );
+                }
                 // 常驻 staging(Anime4K 执行器绑定源纹理,必须同一张)
                 if self.video_staging.as_ref().is_none_or(|t| t.width() != w || t.height() != h) {
                     self.video_staging = Some(self.device.create_texture(&wgpu::TextureDescriptor {
