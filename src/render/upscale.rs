@@ -31,13 +31,18 @@ pub enum UpscaleMode {
     Anime4K(A4kMode, A4kQuality),
 }
 
-/// Anime4K 链变体(bloc97 Mode A/B/C)。
+/// Anime4K 链变体(bloc97 Mode A/AA/B/BB/C/CA,anime4k-wgpu 文档全集):
+/// A 锐利重建、AA 双重锐利(restore→upscale→restore)、B 柔和、BB 双重
+/// 柔和、C 放大+降噪、CA 降噪后再锐利重建。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum A4kMode {
     #[default]
     A,
+    Aa,
     B,
+    Bb,
     C,
+    Ca,
 }
 
 /// Anime4K 模型档位(权重全部已编译进 anime4k-wgpu,选择零二进制成本;
@@ -65,8 +70,11 @@ impl UpscaleMode {
         let mode = match base {
             "fsr" | "fsr1" => return UpscaleMode::Fsr1,
             "anime4k" | "anime4k-a" => A4kMode::A,
+            "anime4k-aa" => A4kMode::Aa,
             "anime4k-b" => A4kMode::B,
+            "anime4k-bb" => A4kMode::Bb,
             "anime4k-c" => A4kMode::C,
+            "anime4k-ca" => A4kMode::Ca,
             _ => return UpscaleMode::Off,
         };
         let q = match qual {
@@ -80,25 +88,29 @@ impl UpscaleMode {
     }
 
     pub fn as_str(&self) -> &'static str {
+        let m = |m: &A4kMode| match m {
+            A4kMode::A => "anime4k-a",
+            A4kMode::Aa => "anime4k-aa",
+            A4kMode::B => "anime4k-b",
+            A4kMode::Bb => "anime4k-bb",
+            A4kMode::C => "anime4k-c",
+            A4kMode::Ca => "anime4k-ca",
+        };
         match self {
             UpscaleMode::Off => "off",
             UpscaleMode::Fsr1 => "fsr",
-            UpscaleMode::Anime4K(m, q) => match (m, q) {
-                (A4kMode::A, A4kQuality::S) => "anime4k-a-s",
-                (A4kMode::A, A4kQuality::M) => "anime4k-a",
-                (A4kMode::A, A4kQuality::L) => "anime4k-a-l",
-                (A4kMode::A, A4kQuality::Vl) => "anime4k-a-vl",
-                (A4kMode::A, A4kQuality::Ul) => "anime4k-a-ul",
-                (A4kMode::B, A4kQuality::S) => "anime4k-b-s",
-                (A4kMode::B, A4kQuality::M) => "anime4k-b",
-                (A4kMode::B, A4kQuality::L) => "anime4k-b-l",
-                (A4kMode::B, A4kQuality::Vl) => "anime4k-b-vl",
-                (A4kMode::B, A4kQuality::Ul) => "anime4k-b-ul",
-                (A4kMode::C, A4kQuality::S) => "anime4k-c-s",
-                (A4kMode::C, A4kQuality::M) => "anime4k-c",
-                (A4kMode::C, A4kQuality::L) => "anime4k-c-l",
-                (A4kMode::C, A4kQuality::Vl) => "anime4k-c-vl",
-                (A4kMode::C, A4kQuality::Ul) => "anime4k-c-ul",
+            UpscaleMode::Anime4K(mode, A4kQuality::M) => m(mode),
+            UpscaleMode::Anime4K(mode, A4kQuality::S) => match m(mode).to_string() + "-s" {
+                s => Box::leak(s.into_boxed_str()),
+            },
+            UpscaleMode::Anime4K(mode, A4kQuality::L) => match m(mode).to_string() + "-l" {
+                s => Box::leak(s.into_boxed_str()),
+            },
+            UpscaleMode::Anime4K(mode, A4kQuality::Vl) => match m(mode).to_string() + "-vl" {
+                s => Box::leak(s.into_boxed_str()),
+            },
+            UpscaleMode::Anime4K(mode, A4kQuality::Ul) => match m(mode).to_string() + "-ul" {
+                s => Box::leak(s.into_boxed_str()),
             },
         }
     }
@@ -482,8 +494,11 @@ impl Upscaler {
             // 档位→模型:S/M/L/VL/UL 权重已全部编译进依赖,零二进制成本。
             let preset = match variant {
                 A4kMode::A => Anime4KPreset::ModeA,
+                A4kMode::Aa => Anime4KPreset::ModeAA,
                 A4kMode::B => Anime4KPreset::ModeB,
+                A4kMode::Bb => Anime4KPreset::ModeBB,
                 A4kMode::C => Anime4KPreset::ModeC,
+                A4kMode::Ca => Anime4KPreset::ModeCA,
             };
             let perf = match quality {
                 A4kQuality::S => Anime4KPerformancePreset::Light,
