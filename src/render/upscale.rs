@@ -28,10 +28,10 @@ pub enum UpscaleMode {
     #[default]
     Off,
     Fsr1,
-    Anime4K(A4kMode),
+    Anime4K(A4kMode, A4kQuality),
 }
 
-/// Anime4K 链变体(bloc97 Mode A/B/C,Medium 模型)。
+/// Anime4K 链变体(bloc97 Mode A/B/C)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum A4kMode {
     #[default]
@@ -40,24 +40,66 @@ pub enum A4kMode {
     C,
 }
 
+/// Anime4K 模型档位(权重全部已编译进 anime4k-wgpu,选择零二进制成本;
+/// 变化的只是运行时显存/耗时):S 最快 … UL 最强。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum A4kQuality {
+    S,
+    #[default]
+    M,
+    L,
+    Vl,
+    Ul,
+}
+
 impl UpscaleMode {
+    /// 形如 `anime4k-a-l`;质量段缺省 = M。裸 `anime4k` = A 档 M。
     pub fn parse(s: &str) -> UpscaleMode {
-        match s {
-            "fsr" | "fsr1" => UpscaleMode::Fsr1,
-            "anime4k" | "anime4k-a" => UpscaleMode::Anime4K(A4kMode::A),
-            "anime4k-b" => UpscaleMode::Anime4K(A4kMode::B),
-            "anime4k-c" => UpscaleMode::Anime4K(A4kMode::C),
-            _ => UpscaleMode::Off,
-        }
+        let (base, qual) = match s.rsplit_once('-') {
+            Some((b, q)) => match q {
+                "s" | "m" | "l" | "vl" | "ul" => (b, q),
+                _ => (s, "m"),
+            },
+            None => (s, "m"),
+        };
+        let mode = match base {
+            "fsr" | "fsr1" => return UpscaleMode::Fsr1,
+            "anime4k" | "anime4k-a" => A4kMode::A,
+            "anime4k-b" => A4kMode::B,
+            "anime4k-c" => A4kMode::C,
+            _ => return UpscaleMode::Off,
+        };
+        let q = match qual {
+            "s" => A4kQuality::S,
+            "l" => A4kQuality::L,
+            "vl" => A4kQuality::Vl,
+            "ul" => A4kQuality::Ul,
+            _ => A4kQuality::M,
+        };
+        UpscaleMode::Anime4K(mode, q)
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             UpscaleMode::Off => "off",
             UpscaleMode::Fsr1 => "fsr",
-            UpscaleMode::Anime4K(A4kMode::A) => "anime4k-a",
-            UpscaleMode::Anime4K(A4kMode::B) => "anime4k-b",
-            UpscaleMode::Anime4K(A4kMode::C) => "anime4k-c",
+            UpscaleMode::Anime4K(m, q) => match (m, q) {
+                (A4kMode::A, A4kQuality::S) => "anime4k-a-s",
+                (A4kMode::A, A4kQuality::M) => "anime4k-a",
+                (A4kMode::A, A4kQuality::L) => "anime4k-a-l",
+                (A4kMode::A, A4kQuality::Vl) => "anime4k-a-vl",
+                (A4kMode::A, A4kQuality::Ul) => "anime4k-a-ul",
+                (A4kMode::B, A4kQuality::S) => "anime4k-b-s",
+                (A4kMode::B, A4kQuality::M) => "anime4k-b",
+                (A4kMode::B, A4kQuality::L) => "anime4k-b-l",
+                (A4kMode::B, A4kQuality::Vl) => "anime4k-b-vl",
+                (A4kMode::B, A4kQuality::Ul) => "anime4k-b-ul",
+                (A4kMode::C, A4kQuality::S) => "anime4k-c-s",
+                (A4kMode::C, A4kQuality::M) => "anime4k-c",
+                (A4kMode::C, A4kQuality::L) => "anime4k-c-l",
+                (A4kMode::C, A4kQuality::Vl) => "anime4k-c-vl",
+                (A4kMode::C, A4kQuality::Ul) => "anime4k-c-ul",
+            },
         }
     }
 }
@@ -283,6 +325,8 @@ struct A4kState {
     /// CNN 链的 2× 输出(scale pass 的源)。
     out2x: wgpu::Texture,
     src_size: (u32, u32),
+    /// 链配置(模式+档位):变化时重建执行器。
+    chain: (A4kMode, A4kQuality),
 }
 
 fn dispatch_2d(pass: &mut wgpu::ComputePass, w: u32, h: u32) {
@@ -355,7 +399,7 @@ impl Upscaler {
                 }
             }
             UpscaleMode::Fsr1 => self.run_fsr(encoder, source, &out, dst),
-            UpscaleMode::Anime4K(_) => self.run_a4k(encoder, source, &out, dst),
+            UpscaleMode::Anime4K(..) => self.run_a4k(encoder, source, &out, dst),
         }
         self.out = Some(out);
         tex
@@ -428,20 +472,29 @@ impl Upscaler {
         dst: (u32, u32),
     ) {
         let src_size = (source.width(), source.height());
-        let variant = match self.mode {
-            UpscaleMode::Anime4K(v) => v,
+        let (variant, quality) = match self.mode {
+            UpscaleMode::Anime4K(v, q) => (v, q),
             _ => unreachable!(),
         };
-        if self.a4k.as_ref().is_none_or(|s| s.src_size != src_size) {
-            // 2× 整数链(CNN 重建+放大),scale pass 收尾到目标尺寸
+        let chain = (variant, quality);
+        if self.a4k.as_ref().is_none_or(|s| s.src_size != src_size || s.chain != chain) {
+            // 2× 整数链(CNN 重建+放大),scale pass 收尾到目标尺寸。
+            // 档位→模型:S/M/L/VL/UL 权重已全部编译进依赖,零二进制成本。
             let preset = match variant {
                 A4kMode::A => Anime4KPreset::ModeA,
                 A4kMode::B => Anime4KPreset::ModeB,
                 A4kMode::C => Anime4KPreset::ModeC,
             };
-            let pipelines = preset.create_pipelines(Anime4KPerformancePreset::Medium, 2.0);
+            let perf = match quality {
+                A4kQuality::S => Anime4KPerformancePreset::Light,
+                A4kQuality::M => Anime4KPerformancePreset::Medium,
+                A4kQuality::L => Anime4KPerformancePreset::High,
+                A4kQuality::Vl => Anime4KPerformancePreset::Ultra,
+                A4kQuality::Ul => Anime4KPerformancePreset::Extreme,
+            };
+            let pipelines = preset.create_pipelines(perf, 2.0);
             let (executor, out2x) = PipelineExecutor::new(&pipelines, &self.device, source);
-            self.a4k = Some(A4kState { executor, out2x, src_size });
+            self.a4k = Some(A4kState { executor, out2x, src_size, chain });
         }
         self.a4k.as_mut().unwrap().executor.pass(encoder);
         let out2x_view = self.a4k.as_ref().unwrap().out2x.create_view(&Default::default());
@@ -630,7 +683,7 @@ mod tests {
         let src = gradient(320, 180);
         let dst = (640, 360);
         let reference = reference_downscale(&src, dst.0, dst.1);
-        for mode in [UpscaleMode::Fsr1, UpscaleMode::Anime4K(A4kMode::A), UpscaleMode::Anime4K(A4kMode::C)] {
+        for mode in [UpscaleMode::Fsr1, UpscaleMode::Anime4K(A4kMode::A, A4kQuality::M), UpscaleMode::Anime4K(A4kMode::C, A4kQuality::L)] {
             let out = upscale_to_image(&device, &queue, &src, mode, dst);
             assert_eq!(out.dimensions(), dst, "{mode:?} 尺寸错误");
             assert!(out.pixels().all(|p| p[3] == 255), "{mode:?} alpha 应恒 1");
