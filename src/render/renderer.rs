@@ -398,7 +398,7 @@ impl Renderer {
                 return false;
             }
             let old = self.textures.remove(key).unwrap();
-            self.texture_bytes -= old.bytes;
+            self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
             self.last_used.remove(key);
         }
         let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("frame size mismatch");
@@ -411,7 +411,15 @@ impl Renderer {
     /// AHardwareBuffer 导入的解码帧)。替换既有槽位;纹理不进 LRU/字节
     /// 记账,旧槽位随 wgpu 生命周期销毁。返回是否替换了已有槽。
     pub fn set_frame_texture(&mut self, key: &str, texture: wgpu::Texture, w: u32, h: u32) -> bool {
-        let replaced = self.textures.remove(key).is_some();
+        let bytes = (w * h * 4) as usize;
+        let replaced = if let Some(old) = self.textures.remove(key) {
+            self.texture_bytes = self.texture_bytes.saturating_sub(old.bytes);
+            self.last_used.remove(key);
+            true
+        } else {
+            false
+        };
+        self.texture_bytes += bytes;
         let view = texture.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(key),
