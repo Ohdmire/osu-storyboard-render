@@ -27,7 +27,7 @@ impl GpuContext {
             compatible_surface: surface,
             force_fallback_adapter: false,
         }))
-        .ok_or_else(|| anyhow!("未找到可用的 GPU 适配器（尝试安装 vulkan 驱动或设置 WGPU_BACKEND=gl）"))?;
+        .map_err(|e| anyhow!("未找到可用的 GPU 适配器({e};尝试安装 vulkan 驱动或设置 WGPU_BACKEND=gl)"))?;
         log::info!(
             "GPU 适配器: {} ({:?})",
             adapter.get_info().name,
@@ -38,13 +38,12 @@ impl GpuContext {
                 label: Some("osu-storyboard-render device"),
                 ..Default::default()
             },
-            None,
         ))?;
         Ok(GpuContext { instance, adapter, device, queue })
     }
 
     /// 阻塞等待 GPU 完成（buffer map 回读前使用）。
     pub fn wait(&self) {
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::Wait);
     }
 }

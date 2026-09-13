@@ -380,8 +380,8 @@ fn print_summary(cs: &CompiledStoryboard, assets: &mut Assets) {
     if triggers > 0 {
         println!("触发器命令: {triggers} 条（需要游戏事件，本渲染器不激活）");
     }
-    if cs.videos > 0 || cs.samples > 0 {
-        println!("视频 {} 个 / 音效 {} 个（不渲染）", cs.videos, cs.samples);
+    if cs.videos > 0 || !cs.samples.is_empty() {
+        println!("视频 {} 个 / 音效 {} 个（不渲染）", cs.videos, cs.samples.len());
     }
     println!("时长: {:.2}s", cs.duration / 1000.0);
 
