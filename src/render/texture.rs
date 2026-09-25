@@ -14,6 +14,8 @@ pub struct Assets {
     resolver: Option<Box<dyn Fn(&str) -> Option<Vec<u8>> + Send>>,
     /// root 下全部文件的小写相对路径索引（懒构建）。
     index: Option<HashMap<String, PathBuf>>,
+    /// `UseSkinSprites`: lookup stem (no extension, lowercased) -> skin file.
+    skin_files: HashMap<String, PathBuf>,
     cache: HashMap<String, Option<RgbaImage>>,
     /// 已缓存解码图像的字节合计(仅 Some 项)。
     cache_bytes: usize,
@@ -48,6 +50,7 @@ impl Assets {
             memory: HashMap::new(),
             resolver: None,
             index: None,
+            skin_files: HashMap::new(),
             cache: HashMap::new(),
             cache_bytes: 0,
             max_cache_bytes: usize::MAX,
@@ -62,6 +65,7 @@ impl Assets {
             memory: map,
             resolver: None,
             index: None,
+            skin_files: HashMap::new(),
             cache: HashMap::new(),
             cache_bytes: 0,
             max_cache_bytes: usize::MAX,
@@ -78,6 +82,7 @@ impl Assets {
             memory: HashMap::new(),
             resolver: Some(f),
             index: None,
+            skin_files: HashMap::new(),
             cache: HashMap::new(),
             cache_bytes: 0,
             max_cache_bytes: usize::MAX,
@@ -88,6 +93,14 @@ impl Assets {
     /// CPU 解码缓存预算(字节):视频式逐帧动画的 storyboard 可引用成千张
     /// 独立贴图,嵌入式宿主应设上限防内存膨胀;超限后随机淘汰缓存项
     /// (HashMap 无序,循环动画场景下被淘汰的很快会重新解码)。
+    /// `UseSkinSprites`: skin files keyed like `LegacySkin` lookups
+    /// (lowercased path without extension). Checked before the beatmap folder.
+    pub fn set_skin_files(&mut self, files: HashMap<String, PathBuf>) {
+        self.skin_files = files;
+        self.cache.clear();
+        self.cache_bytes = 0;
+    }
+
     pub fn set_cache_budget(&mut self, bytes: usize) {
         self.max_cache_bytes = bytes;
     }
@@ -163,6 +176,17 @@ impl Assets {
                 }
             }
             return None;
+        }
+
+        if !self.skin_files.is_empty() {
+            let lower = norm.to_lowercase();
+            let stem = match lower.rfind('.') {
+                Some(i) if !lower[i + 1..].contains('/') => &lower[..i],
+                _ => lower.as_str(),
+            };
+            if let Some(path) = self.skin_files.get(stem) {
+                return decode(path);
+            }
         }
 
         // 路径变体：原样；文件名无扩展名时补 .png/.jpg/.jpeg
