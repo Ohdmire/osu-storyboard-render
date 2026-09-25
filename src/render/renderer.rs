@@ -516,6 +516,12 @@ impl Renderer {
                     operation: wgpu::BlendOperation::Add,
                 },
             });
+            // osu-framework `BlendingParameters.Additive` 是 RGB
+            // (SrcAlpha, One)。精灵输出已预乘,RGB 用 One/One 等价。
+            // Alpha 不累加(Zero/One):槽位从透明清屏,之后用预乘 over
+            // 贴回屏幕。Alpha 也 One/One 时,重叠的加色精灵会把槽位
+            // 撑成不透明,贴回时盖住背景而不是往背景上加光,背景亮度
+            // 就再也透不过来(MariannE 4:19 的一排 damnaestar)。
             let additive = make(wgpu::BlendState {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
@@ -523,7 +529,7 @@ impl Renderer {
                     operation: wgpu::BlendOperation::Add,
                 },
                 alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
+                    src_factor: wgpu::BlendFactor::Zero,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },
